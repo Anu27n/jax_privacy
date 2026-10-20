@@ -717,6 +717,25 @@ class BatchPaddingTest(parameterized.TestCase):
     num_padding_in_last = (microbatches[3] == -1).sum()
     self.assertEqual(num_padding_in_last, 2)
 
+  @parameterized.parameters(
+      (0, np.int8),
+      (127, np.int8),
+      (128, np.int16),
+      (32767, np.int16),
+      (32768, np.int32),
+      (2**31 - 1, np.int32),
+      (2**31, np.int64),
+  )
+  def test_get_dtype_fits_positive_num_examples(
+      self, num_examples, expected_dtype
+  ):
+    dtype = batch_selection._get_dtype(num_examples)
+    self.assertEqual(dtype, np.dtype(expected_dtype))
+    # Verify that scalar modulo by num_examples (e.g. in PyGrain MapDataset)
+    # does not raise OverflowError under NumPy 2.0 NEP 50.
+    if num_examples > 0:
+      self.assertEqual(dtype.type(-1) % num_examples, num_examples - 1)
+
 
 if __name__ == '__main__':
   absltest.main()

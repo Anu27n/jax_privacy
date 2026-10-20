@@ -115,6 +115,11 @@ class PartitionType(enum.Enum):
   """Examples will be shuffled and then split into groups of equal size."""
 
 
+def _get_dtype(num_examples: int) -> np.dtype:
+  """Returns the smallest signed integer dtype that fits ``num_examples``."""
+  return np.min_scalar_type(-(num_examples + 1))
+
+
 def _independent_partition(
     num_examples: int,
     num_groups: int,
@@ -313,7 +318,7 @@ class CyclicPoissonSampling(BatchSelectionStrategy):
       self, num_examples: int, rng: RngType = None
   ) -> Iterator[np.ndarray]:
     rng = np.random.default_rng(rng)
-    dtype = np.min_scalar_type(-num_examples)
+    dtype = _get_dtype(num_examples)
 
     if self.partition_type == PartitionType.INDEPENDENT:
       partition_fn = _independent_partition
@@ -368,7 +373,7 @@ class BallsInBinsSampling(BatchSelectionStrategy):
       self, num_examples: int, rng: RngType = None
   ) -> Iterator[np.ndarray]:
     rng = np.random.default_rng(rng)
-    dtype = np.min_scalar_type(-num_examples)
+    dtype = _get_dtype(num_examples)
     groups = _independent_partition(num_examples, self.cycle_length, rng, dtype)
 
     for i in range(self.iterations):
@@ -457,7 +462,7 @@ class RandomAllocationSampling(BatchSelectionStrategy):
       self, num_examples: int, rng: RngType = None
   ) -> Iterator[np.ndarray]:
     rng = np.random.default_rng(rng)
-    dtype = np.min_scalar_type(-num_examples)
+    dtype = _get_dtype(num_examples)
 
     partition = _independent_partition(
         num_examples, self.cycle_length, rng, dtype
@@ -521,7 +526,7 @@ class FixedBatchSampling(BatchSelectionStrategy):
           'batch_size must be <= num_examples when replace is False.'
       )
     rng = np.random.default_rng(rng)
-    dtype = np.min_scalar_type(-num_examples)
+    dtype = _get_dtype(num_examples)
     for _ in range(self.iterations):
       yield rng.choice(
           num_examples,
@@ -587,7 +592,7 @@ class BMinSepSampling(BatchSelectionStrategy):
     p = self.sampling_prob
     b = self.min_sep
     rng = np.random.default_rng(rng)
-    dtype = np.min_scalar_type(-num_examples)
+    dtype = _get_dtype(num_examples)
     if self.warm_start and b > 1:
       size = rng.binomial(n=num_examples, p=(b - 1) * p / (1 + (b - 1) * p))
       concatenated_history = rng.choice(
@@ -693,7 +698,7 @@ class UserSelectionStrategy:
     unique, inverse = np.unique(user_ids, return_inverse=True)
     num_users = unique.size
     num_examples = user_ids.size
-    dtype = np.min_scalar_type(-max(num_examples, 1))
+    dtype = _get_dtype(num_examples)
 
     # Group example indices by user once to avoid an O(n) scan per user.
     order = np.argsort(inverse, kind='stable').astype(dtype, copy=False)
