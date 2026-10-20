@@ -1088,5 +1088,82 @@ class DeviceHbmLimitTest(parameterized.TestCase):
     self.assertIsNone(_compilation._device_hbm_limit())
 
 
+class DPTrainerCanaryAuditTest(parameterized.TestCase):
+  """Tests for num_examples validation and empirical privacy auditing."""
+
+  @parameterized.named_parameters(*_DATASET_TYPES)
+  def test_num_examples_validation(self, to_dataset):
+    params = jnp.array([1.0, 2.0])
+    config = execution_plan.BandMFConfig.default(
+        num_bands=1,
+        iterations=2,
+        noise_multiplier=1.0,
+        expected_participations=2,
+        num_examples=10,
+    )
+    trainer = training.DPTrainer(
+        config=config,
+        loss_fn=_quadratic_loss,
+        optimizer=optax.sgd(0.1),
+    )
+
+    short_ds = to_dataset(np.zeros((8, 2), dtype=np.float32))
+    with self.assertRaisesRegex(ValueError, 'num_examples=8.*expected 10'):
+      trainer.fit(short_ds, params, rng_or_seed=0)
+
+    exact_ds = to_dataset(np.zeros((10, 2), dtype=np.float32))
+    state = trainer.fit(exact_ds, params, rng_or_seed=0)
+    self.assertEqual(int(state.step), 2)
+
+    long_ds = to_dataset(np.zeros((12, 2), dtype=np.float32))
+    with self.assertRaisesRegex(ValueError, 'num_examples=12.*expected 10'):
+      trainer.fit(long_ds, params, rng_or_seed=0)
+
+  @parameterized.parameters(True, False)
+  def test_score_canaries(self, pass_untrained):
+    init_params = jnp.array([0.0, 0.0])
+    trained = jnp.array([2.0, 2.0])
+    canaries = np.arange(10, dtype=np.float32).reshape(5, 2)
+    untrained = init_params if pass_untrained else None
+    kw = dict(microbatch_size=2, prng_key=jax.random.key(0))
+
+    scores = training._score_canaries(
+        _quadratic_loss, trained, canaries, untrained, **kw
+    )
+    l0 = np.mean((init_params - canaries) ** 2, axis=1) if pass_untrained else 0
+    expected = l0 - np.mean((trained - canaries) ** 2, axis=1)
+    np.testing.assert_allclose(scores, expected, rtol=1e-5, atol=1e-5)
+
+  @parameterized.product(
+      pass_untrained=[True, False],
+      identical_canaries=[False, True],
+  )
+  def test_audit(self, pass_untrained, identical_canaries):
+    init_params = jnp.array([0.0, 0.0])
+    held_in = np.full((5, 2), 4.0, dtype=np.float32)
+    held_out = held_in if identical_canaries else -held_in
+    dataset = np.concatenate([np.zeros((4, 2), dtype=np.float32), held_in])
+
+    trainer = training.DPTrainer(
+        config=_make_config(iterations=5, noise_multiplier=0.0),
+        performance_flags=execution_plan.PerformanceFlags(microbatch_size=2),
+        loss_fn=_quadratic_loss,
+        optimizer=optax.sgd(0.1),
+    )
+
+    state = trainer.fit(dataset, init_params, rng_or_seed=0)
+    untrained = init_params if pass_untrained else None
+    auditor = training.audit(
+        _quadratic_loss,
+        state.params,
+        held_in,
+        held_out,
+        untrained,
+        microbatch_size=2,
+    )
+    expected_auroc = 0.5 if identical_canaries else 1.0
+    self.assertAlmostEqual(float(auditor.attack_auroc()), expected_auroc)
+
+
 if __name__ == '__main__':
   absltest.main()

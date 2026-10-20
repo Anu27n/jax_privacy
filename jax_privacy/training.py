@@ -29,6 +29,19 @@ Because it is designed to be framework and model-agnostic, there are a few
 things that are explicitly out of scope, like checkpointing and metrics logging.
 Callers are expected to implement these things themselves via dependency
 injection through the callback_fn option.
+
+Example Usage:
+
+  >>> def loss_fn(params, batch, prng):
+  ...   return jax.numpy.mean((params - batch) ** 2), {}
+  >>> cfg = BandMFConfig.default(1, 5, 5, noise_multiplier=0.0)
+  >>> trainer = DPTrainer(config=cfg, loss_fn=loss_fn, optimizer=optax.sgd(0.5))
+  >>> data, in_c, out_c = np.zeros((8, 2)), np.ones((4, 2)), -np.ones((4, 2))
+  >>> params0 = np.zeros(2)
+  >>> state = trainer.fit(np.vstack([data, in_c]), params0, rng_or_seed=0)
+  >>> auditor = audit(loss_fn, state.params, in_c, out_c, params0)
+  >>> float(auditor.attack_auroc())
+  1.0
 """
 
 from collections.abc import Callable
@@ -41,10 +54,13 @@ import jax
 import jax_privacy
 from jax_privacy import _compilation
 from jax_privacy import _data_loading
+from jax_privacy import _validate
+from jax_privacy import auditing
 from jax_privacy import execution_plan
 from jax_privacy import optimizers as aug_optimizers
 import numpy as np
 import optax
+from optax import microbatching
 
 # Re-export key symbols so users can access them via jax_privacy.training.
 BandMFConfig = execution_plan.BandMFConfig
@@ -71,9 +87,8 @@ AutotuneMicrobatch = _compilation.AutotuneMicrobatch
 class LossFn(Protocol):
   """Expected contract for loss functions used in DP training.
 
-  Loss functions must accept ``params`` and a ``data`` batch, and return
-  ``(loss, aux)``.  They may optionally accept a PRNG key as a third
-  positional argument for stochastic operations (e.g., dropout).
+  Loss functions must accept ``params``, ``data``, and ``prng`` and return
+  ``(loss, aux)``.
 
   Any additional context the loss function needs — frozen parameters,
   model configuration, label smoothing constants, etc. — should be closed
@@ -307,6 +322,10 @@ class DPTrainer:
     Returns:
       Final ``TrainingState``.
     """
+    if (n := getattr(self.config, "num_examples", None)) is not None:
+      is_map = _data_loading.is_map_dataset(dataset)
+      m = len(dataset) if is_map else _validate.batch(dataset)
+      _validate.equal(n, num_examples=m)
     # Precompilation resolves the trainer and compiles the required train_steps.
     # It may return a *different* trainer (e.g. AutotuneMicrobatch picks a
     # concrete microbatch size), so the loop below runs on ``trainer`` rather
@@ -365,3 +384,67 @@ class DPTrainer:
           callback(step, state, aux)
 
     return state
+
+
+@jax.jit(static_argnames=["loss_fn", "microbatch_size"])
+def _score_canaries(
+    loss_fn: LossFn,
+    trained: Params,
+    canaries: Batch,
+    untrained: Params | None = None,
+    *,
+    microbatch_size: int | None = None,
+    prng_key: jax.Array,
+) -> jax.Array:
+  """Computes per-canary loss reductions ``loss(untrained) - loss(trained)``."""
+  n = _validate.batch(canaries)
+  mb = microbatch_size or 1
+  idx = jax_privacy.batch_selection.pad_to_multiple_of(np.arange(n), mb)
+
+  def score_one(x, key):
+    b = jax.tree.map(lambda a: a[None], x)
+    # Reuse key across both evaluations to cancel stochastic loss variance.
+    l0 = 0.0 if untrained is None else loss_fn(untrained, b, key)[0]
+    return l0 - loss_fn(trained, b, key)[0]
+
+  vmap_fn = microbatching.micro_vmap(score_one, (0, 0), microbatch_size=mb)
+  padded = jax.tree.map(lambda x: x[idx], canaries)
+  keys = jax.random.split(prng_key, idx.size)
+  return vmap_fn(padded, keys)[:n]
+
+
+def audit(
+    loss_fn: LossFn,
+    trained: Params,
+    in_canaries: Batch,
+    out_canaries: Batch,
+    untrained: Params | None = None,
+    *,
+    microbatch_size: int | None = None,
+    prng_key: jax.Array | int = 0,
+) -> auditing.CanaryScoreAuditor:
+  """Scores held-in and held-out canaries and returns an auditor.
+
+  Args:
+    loss_fn: Per-example loss function matching :class:`LossFn`.
+    trained: Trained model parameters.
+    in_canaries: Held-in canary batch included in the training dataset.
+    out_canaries: Held-out canary batch excluded from the training dataset.
+    untrained: Optional untrained model parameters used to center canary scores
+      as ``loss(untrained) - loss(trained)``. If ``None``, scores are
+      ``-loss(trained)``.
+    microbatch_size: Optional microbatch size for evaluating ``loss_fn``.
+    prng_key: Random seed or PRNG key for loss_fn evaluation.
+
+  Returns:
+    A :class:`~jax_privacy.auditing.CanaryScoreAuditor` initialized with the
+    held-in and held-out canary scores.
+  """
+  if isinstance(prng_key, int):
+    prng_key = jax.random.key(prng_key)
+  in_key, out_key = jax.random.split(prng_key)
+  args = (loss_fn, trained)
+  kw = dict(untrained=untrained, microbatch_size=microbatch_size)
+  in_scores = _score_canaries(*args, in_canaries, prng_key=in_key, **kw)
+  out_scores = _score_canaries(*args, out_canaries, prng_key=out_key, **kw)
+  return auditing.CanaryScoreAuditor(in_scores, out_scores)
