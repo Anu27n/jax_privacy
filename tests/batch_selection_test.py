@@ -250,6 +250,10 @@ class BatchSelectionTest(parameterized.TestCase):
       # 20 is a multiple of 2 but not of 3, and 21 is a multiple of 3 but not
       # of 2, so both the even and uneven cases are covered.
       iterations=[20, 21],
+      partition_type=[
+          batch_selection.PartitionType.INDEPENDENT,
+          batch_selection.PartitionType.EQUAL_SPLIT,
+      ],
   )
   def test_random_allocation_sampling(
       self,
@@ -257,12 +261,14 @@ class BatchSelectionTest(parameterized.TestCase):
       num_participations,
       cycle_length,
       iterations,
+      partition_type,
   ):
     """Tests random allocation participation counts and truncation."""
     strategy = batch_selection.RandomAllocationSampling(
         total_participations=num_participations,
         iterations=iterations,
         cycle_length=cycle_length,
+        partition_type=partition_type,
     )
     batches = list(strategy.batch_iterator(num_examples, rng=0))
 
@@ -276,7 +282,10 @@ class BatchSelectionTest(parameterized.TestCase):
       # Without truncation, each example appears in *exactly* k batches.
       for count in counts.values():
         self.assertEqual(count, num_participations)
-      self.assertLen(counts, num_examples)
+      expected_examples = num_examples
+      if partition_type == batch_selection.PartitionType.EQUAL_SPLIT:
+        expected_examples = (num_examples // cycle_length) * cycle_length
+      self.assertLen(counts, expected_examples)
     else:
       # With truncation, groups < iterations % cycle_length run all
       # ceil(iterations / cycle_length) cycles and participate exactly k times,
@@ -371,10 +380,56 @@ class BatchSelectionTest(parameterized.TestCase):
       {'total_participations': 5, 'iterations': 10, 'cycle_length': 3},
       {'total_participations': -1, 'iterations': 10, 'cycle_length': 1},
       {'total_participations': 1, 'iterations': 10, 'cycle_length': 0},
+      {'total_participations': 1, 'iterations': 10, 'sampling_prob': -0.1},
+      {'total_participations': 1, 'iterations': 10, 'sampling_prob': 1.1},
   )
   def test_random_allocation_sampling_validation(self, **kwargs):
     with self.assertRaises(ValueError):
       batch_selection.RandomAllocationSampling(**kwargs)
+
+  def test_random_allocation_uneven_iterations_logs_warning(self):
+    with self.assertLogs(level='WARNING') as logs:
+      batch_selection.RandomAllocationSampling(
+          total_participations=2, iterations=10, cycle_length=3
+      )
+    self.assertIn('multiple of cycle_length', logs.output[0])
+
+  @parameterized.parameters(
+      batch_selection.PartitionType.INDEPENDENT,
+      batch_selection.PartitionType.EQUAL_SPLIT,
+  )
+  def test_random_allocation_subsampling(self, partition_type):
+    b, k, t, q, n = 4, 8, 96, 0.5, 20000
+    strategy = batch_selection.RandomAllocationSampling(
+        k, t, cycle_length=b, partition_type=partition_type, sampling_prob=q
+    )
+    batches = list(strategy.batch_iterator(n, rng=0))
+    _check_b_min_sep_property(batches, b)
+    _check_subset_of_kb_participation(batches, b)
+    counts = np.bincount(np.concatenate(batches), minlength=n)
+    self.assertLessEqual(counts.max(), k)
+    self.assertAlmostEqual(counts.mean(), k * q, delta=0.05)
+
+  @parameterized.parameters(
+      batch_selection.PartitionType.INDEPENDENT,
+      batch_selection.PartitionType.EQUAL_SPLIT,
+  )
+  def test_random_allocation_matches_cyclic_poisson(self, partition_type):
+    b, t, q, n = 4, 40, 0.5, 30000
+    k = t // b
+    ra = batch_selection.RandomAllocationSampling(
+        k, t, cycle_length=b, partition_type=partition_type, sampling_prob=q
+    )
+    cyclic = batch_selection.CyclicPoissonSampling(
+        q, t, cycle_length=b, partition_type=partition_type
+    )
+
+    def count_hist(strategy):
+      indices = np.concatenate(list(strategy.batch_iterator(n, rng=0)))
+      counts = np.bincount(indices, minlength=n)
+      return np.bincount(counts, minlength=k + 1) / n
+
+    np.testing.assert_allclose(count_hist(ra), count_hist(cyclic), atol=0.02)
 
   def test_cyclic_poisson_sampling_independent_is_deterministic(self):
     """CyclicPoissonSampling should respect the provided RNG."""
