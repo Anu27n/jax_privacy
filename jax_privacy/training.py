@@ -38,7 +38,8 @@ Example Usage:
   >>> trainer = DPTrainer(config=cfg, loss_fn=loss_fn, optimizer=optax.sgd(0.5))
   >>> data, in_c, out_c = np.zeros((8, 2)), np.ones((4, 2)), -np.ones((4, 2))
   >>> params0 = np.zeros(2)
-  >>> state = trainer.fit(np.vstack([data, in_c]), params0, rng_or_seed=0)
+  >>> state0 = trainer.init(params0)
+  >>> state = trainer.fit(np.vstack([data, in_c]), state0, rng_or_seed=0)
   >>> auditor = audit(loss_fn, state.params, in_c, out_c, params0)
   >>> float(auditor.attack_auroc())
   1.0
@@ -179,6 +180,10 @@ class DPTrainer:
       of zero-padded examples. If omitted on a ``grain.MapDataset``, it is
       inferred from ``dataset[0]``, which requires a non-empty dataset with
       fixed element shapes.
+    noise_seed: Optional seed for the random number generator used for noise
+      addition. If ``None``, a fresh random seed is drawn; pass an explicit seed
+      for multi-host coordination or reproducible tests (and keep it secret in
+      production deployments).
   """
 
   config: execution_plan.ExecutionPlanConfig
@@ -194,6 +199,7 @@ class DPTrainer:
       default_factory=_compilation.PadToMultiple
   )
   padding_example: Any = None
+  noise_seed: int | None = None
 
   def __post_init__(self):
     _ = self.plan  # Build untraced so cached PRNG key isn't a leaked tracer.
@@ -201,8 +207,9 @@ class DPTrainer:
   @functools.cached_property
   def plan(self) -> execution_plan.DPExecutionPlan:
     """``DPExecutionPlan`` built from ``config`` and ``performance_flags``."""
-    return self.config.make(self.performance_flags)
+    return self.config.make(self.performance_flags, noise_seed=self.noise_seed)
 
+  @jax.jit(static_argnames=["self"])
   def init(self, params: Params) -> TrainingState:
     """Initialize a ``TrainingState`` at step 0."""
     optimizer = aug_optimizers.as_augmented_optimizer(self.optimizer)
@@ -275,13 +282,11 @@ class DPTrainer:
   def _precompile(
       self,
       dataset: Dataset,
-      state: Params | TrainingState,
+      state: TrainingState,
       *,
       rng_or_seed: np.random.Generator | int | None = None,
   ) -> tuple["DPTrainer", dict[int, PrecompiledFuture]]:
     """[ADVANCED] Resolve config and AOT-compile the steps ``fit`` runs."""
-    if not isinstance(state, TrainingState):
-      state = jax.eval_shape(self.init, state)
     return _compilation.precompile(
         self, dataset, state, rng_or_seed=rng_or_seed
     )
@@ -289,7 +294,7 @@ class DPTrainer:
   def fit(
       self,
       dataset: Dataset,
-      state: Params | TrainingState,
+      state: TrainingState,
       *,
       callback: CallbackFn | None = None,
       rng_or_seed: np.random.Generator | int | None = None,
@@ -302,10 +307,12 @@ class DPTrainer:
         first axis of each leaf is the batch / example dimension, or as a
         ``grain.MapDataset`` (or ``grain.RandomAccessDataSource``) where each
         element is a PyTree of arrays for a single example.
-      state: Initial parameter PyTree or a resumable ``TrainingState``. If a
-        ``TrainingState`` is provided, training continues from the step recorded
-        in the state, and the batch selection iterator safely fast-forwards to
-        maintain deterministic DP properties.
+      state: Initial or resumable ``TrainingState`` (e.g., from :meth:`init`).
+        Training starts or continues from ``state.step``, and the batch
+        selection iterator safely fast-forwards to maintain deterministic DP
+        properties. Note that ``state`` buffers are donated during training
+        (:meth:`train_step` uses ``donate_argnames=["state"]``), so copy any
+        arrays you need to retain after ``fit`` returns.
       callback: Called after each step as ``callback(step, state, aux)``.
         ``step`` is a Python int.
       rng_or_seed: Optional random seed or ``numpy.random.Generator``, used for
@@ -332,10 +339,6 @@ class DPTrainer:
     # than ``self``.
     trainer: DPTrainer = self
     futures: dict[int, PrecompiledFuture] = {}
-
-    # Clone state. train_step uses donate_argnames.
-    if not isinstance(state, TrainingState):
-      state = self.init(jax.tree.map(jax.numpy.copy, state))
 
     if (
         precompile
